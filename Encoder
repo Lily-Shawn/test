@@ -1,0 +1,67 @@
+class Encoder(nn.Module):
+    def __init__(self, args, topology):
+        super(Encoder, self).__init__()
+        self.topologies = [topology] ##human model skeleton topologies 
+        if args.rotation == 'euler_angle': self.channel_base = [3]
+        elif args.rotation == 'quaternion': self.channel_base = [4]
+        ##Determine the number of channels based on the dimensions of the dynamically rotating data
+        self.channel_list = []
+        self.edge_num = [len(topology) + 1]##Determine the number of joint segments based on the obtained data on the topology of the human model
+        self.pooling_list = []
+        self.layers = nn.ModuleList()
+        self.args = args
+        self.convs = []
+
+        kernel_size = args.kernel_size#Convolution kernel size
+        padding = (kernel_size - 1) // 2##Padding in CNN
+        bias = True
+        if args.skeleton_info == 'concat': add_offset = True
+        else: add_offset = False
+
+        for i in range(args.num_layers):
+            self.channel_base.append(self.channel_base[-1] * 2)
+
+        ##Determines the number of encoder internal calculations
+
+        for i in range(args.num_layers):
+            seq = []
+            neighbor_list = find_neighbor(self.topologies[i], args.skeleton_dist)##Determine adjacent joint points based on the topology of the human body
+            in_channels = self.channel_base[i] * self.edge_num[i]## Input channel of CNN
+            out_channels = self.channel_base[i+1] * self.edge_num[i]## output channel of CNN
+            if i == 0: self.channel_list.append(in_channels)
+            self.channel_list.append(out_channels)
+
+            for _ in range(args.extra_conv):
+                seq.append(SkeletonConv(neighbor_list, in_channels=in_channels, out_channels=in_channels,
+                                        joint_num=self.edge_num[i], kernel_size=kernel_size, stride=1,
+                                        padding=padding, padding_mode=args.padding_mode, bias=bias))
+            seq.append(SkeletonConv(neighbor_list, in_channels=in_channels, out_channels=out_channels,
+                                    joint_num=self.edge_num[i], kernel_size=kernel_size, stride=2,
+                                    padding=padding, padding_mode=args.padding_mode, bias=bias, add_offset=add_offset,
+                                    in_offset_channel=3 * self.channel_base[i] // self.channel_base[0]))
+            ##Skeleton CNN. It is used to extract dynamic feature
+            self.convs.append(seq[-1])
+            last_pool = True if i == args.num_layers - 1 else False
+            pool = SkeletonPool(edges=self.topologies[i], pooling_mode=args.skeleton_pool,
+                                channels_per_edge=out_channels // len(neighbor_list), last_pool=last_pool)
+            ##pooling in CNN. It is used to merge lower joint
+            seq.append(pool)
+            seq.append(nn.LeakyReLU(negative_slope=0.2))
+            self.layers.append(nn.Sequential(*seq))
+
+            self.topologies.append(pool.new_edges)
+            self.pooling_list.append(pool.pooling_list)
+            self.edge_num.append(len(self.topologies[-1]) + 1)
+            if i == args.num_layers - 1:
+                self.last_channel = self.edge_num[-1] * self.channel_base[i + 1]
+
+    def forward(self, input, offset=None):
+        # padding the one zero row to global position, so each joint including global position has 4 channels as input
+        if self.args.rotation == 'quaternion' and self.args.pos_repr != '4d':
+            input = torch.cat((input, torch.zeros_like(input[:, [0], :])), dim=1)
+
+        for i, layer in enumerate(self.layers):
+            if self.args.skeleton_info == 'concat' and offset is not None:
+                self.convs[i].set_offset(offset[i])##concat offset in result
+            input = layer(input)
+        return input
